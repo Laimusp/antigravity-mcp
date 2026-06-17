@@ -1,0 +1,13 @@
+node_modules/
+__pycache__/
+*.pyc
+*.log
+# local dev/test scratch
+_*.mjs
+_*.py
+_*.txt
+# never commit anything token/secret-shaped
+*oauth*
+*secret*
+*token*.json
+antigravity_oauth.json

@@ -1,0 +1,17 @@
+{
+  "name": "antigravity-mcp",
+  "version": "1.0.0",
+  "description": "MCP server exposing Google Antigravity (Gemini 3 Pro) as a headless tool for Claude Code. Talks directly to the Antigravity backend (streamGenerateContent) through the local RU-unlock proxy, using the Antigravity OAuth token from Windows Credential Manager, with automatic account rotation on quota.",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "antigravity-mcp": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  }
+}
