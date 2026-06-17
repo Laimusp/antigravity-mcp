@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 // antigravity-mcp — expose Google Antigravity (Gemini 3 Pro) to Claude Code as an MCP tool.
 //
-// The official Antigravity CLI (`agy -p`) renders its answer to a TUI and never writes it to
-// a pipe, so it cannot be wrapped directly. Instead this server delegates to agy_backend.py,
-// which calls the Antigravity backend (streamGenerateContent) through the local RU-unlock
-// proxy using the Antigravity OAuth token from Windows Credential Manager, and rotates
-// accounts on quota. The big prompt is delivered to the backend over STDIN (no arg-length
-// limit), mirroring the gemini-mcp pattern this is forked from.
+// THIN CALLER ONLY. This file has ZERO rotation / quota / auth logic. It just spawns
+// agy_backend.py, pipes the prompt in over STDIN, and returns its stdout. All the smarts
+// (OAuth from Credential Manager, refresh, proactive + reactive account rotation) live in
+// agy_backend.py — exactly like jamubc's gemini-mcp called `gemini -p` while gchange handled
+// rotation outside it. Same pattern, just agy_backend.py in place of the gemini CLI.
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
