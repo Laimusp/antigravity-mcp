@@ -29,8 +29,12 @@ Claude Code ──MCP(stdio)──> src/index.js ──spawn,stdin──> agy_ba
   (default `http://127.0.0.1:9999`, the `agy-fix` proxy) which clears eligibility + routes via an
   EU exit. On a non-blocked network you can point `CLOUD_CODE_URL` straight at
   `https://daily-cloudcode-pa.googleapis.com`.
-- **Quota rotation**: on HTTP 429 the backend calls the sibling
-  [`antigravity-auth-manager`](../antigravity-auth-manager) `agy_switch.py next` and retries.
+- **Quota rotation** (lives in the backend, not the MCP layer — the MCP server just calls it):
+  - *proactive* — before each request, if the active account's quota for the model is below a
+    configurable threshold, switch to an account that still has quota (cached ~3 min);
+  - *reactive* — on HTTP 429 / RESOURCE_EXHAUSTED, switch and retry.
+  Both rotate via the sibling [`antigravity-auth-manager`](../antigravity-auth-manager). Configure
+  with `agychange config threshold <pct>` (or env `AGY_QUOTA_THRESHOLD`); `0` disables proactive.
 
 ## Install
 
@@ -70,7 +74,12 @@ Then call `mcp__antigravity__ask-antigravity`.
 | `CLOUD_CODE_URL` | `http://127.0.0.1:9999` | proxy/base for the Antigravity backend |
 | `AGY_MODEL` | `gemini-pro-agent` | model id (= Gemini 3.1 Pro High) |
 | `AGY_PYTHON` | `python` | python interpreter for the backend |
-| `AGY_MAX_SWAPS` | `3` | account rotations to try on quota |
+| `AGY_MAX_SWAPS` | `3` | reactive account rotations to try on 429 |
+| `AGY_QUOTA_THRESHOLD` | `10` | proactive switch when active account's quota % is below this (`0` = off) |
+| `AGY_PROACTIVE` | `1` | set `0` to disable the proactive pre-check |
+
+Proactive rotation is configured persistently via `agychange config threshold <pct>` →
+`~/.gemini/antigravity_config.json` (`{enabled, threshold, cache_minutes}`).
 
 Model ids seen on the account: `gemini-pro-agent`, `gemini-3.1-pro-high`, `gemini-3.1-pro-low`,
 `gemini-3-flash`, `claude-opus-4-6-thinking`, `claude-sonnet-4-6`, `gpt-oss-120b-medium`.

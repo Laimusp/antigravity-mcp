@@ -248,9 +248,107 @@ def swap_account():
         return False
 
 
+# ---- proactive quota-based rotation (configurable threshold) ----------------
+# Mirrors the gemini-cli + gchange pre-check: BEFORE a request, if the active
+# account's quota for the target model is below the threshold, switch first.
+# Lives here in the "agy" layer; the MCP server stays a thin caller.
+CONFIG_FILE = os.path.expanduser("~/.gemini/antigravity_config.json")
+QUOTA_CACHE_FILE = os.path.expanduser("~/.gemini/antigravity_quota_cache.json")
+ACCOUNTS_FILE = os.path.expanduser("~/.gemini/antigravity_accounts.json")
+
+
+def load_config():
+    cfg = {"enabled": True, "threshold": 10.0, "cache_minutes": 3}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception:
+            pass
+    if os.environ.get("AGY_QUOTA_THRESHOLD"):
+        try:
+            cfg["threshold"] = float(os.environ["AGY_QUOTA_THRESHOLD"])
+        except ValueError:
+            pass
+    if os.environ.get("AGY_PROACTIVE") == "0":
+        cfg["enabled"] = False
+    return cfg
+
+
+def _active_email():
+    try:
+        with open(ACCOUNTS_FILE, encoding="utf-8") as f:
+            return json.load(f).get("active")
+    except Exception:
+        return None
+
+
+def _pool_size():
+    try:
+        with open(ACCOUNTS_FILE, encoding="utf-8") as f:
+            return len(json.load(f).get("order", [])) or 1
+    except Exception:
+        return 1
+
+
+def _retrieve_quota(sess):
+    if sess.proj is None:
+        sess.load_project()
+    r = requests.post(PROXY + "/v1internal:retrieveUserQuota", headers=sess.headers(),
+                      json={"project": sess.proj}, timeout=30)
+    if not r.ok:
+        return None
+    return {b["modelId"]: b.get("remainingFraction")
+            for b in (r.json() or {}).get("buckets", []) if b.get("modelId")}
+
+
+def _quota_fraction(sess, email, model, cache_min):
+    cache = {}
+    if os.path.exists(QUOTA_CACHE_FILE):
+        try:
+            with open(QUOTA_CACHE_FILE, encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+    ent = cache.get(email or "")
+    if ent and (time.time() - ent.get("ts", 0)) < cache_min * 60:
+        return ent.get("buckets", {}).get(model)
+    q = _retrieve_quota(sess)
+    if q is None:
+        return None
+    if email:
+        cache[email] = {"ts": time.time(), "buckets": q}
+        try:
+            with open(QUOTA_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+        except Exception:
+            pass
+    return q.get(model)
+
+
+def ensure_quota_before(sess, model, cfg):
+    """Proactively switch BEFORE the request if the active account's quota for
+    `model` is below the configured threshold (percent)."""
+    if not cfg.get("enabled") or float(cfg.get("threshold", 0)) <= 0:
+        return
+    thr = float(cfg["threshold"]) / 100.0
+    for _ in range(max(1, _pool_size())):
+        email = _active_email()
+        frac = _quota_fraction(sess, email, model, int(cfg.get("cache_minutes", 3)))
+        if frac is None or frac >= thr:
+            return  # quota OK (or unknown) — proceed; reactive 429 still covers surprises
+        log("proactive rotate: %s %s=%.1f%% < %s%%" % (email, model, frac * 100, cfg["threshold"]))
+        if not swap_account():
+            return
+        sess.reload_after_swap()
+        sess.ensure_fresh()
+    # all accounts below threshold — proceed anyway
+
+
 def ask(prompt, model=DEFAULT_MODEL, system=None, thinking=False, on_progress=None):
     sess = Session()
     sess.ensure_fresh()
+    ensure_quota_before(sess, model, load_config())
     for attempt in range(MAX_SWAPS + 1):
         try:
             return stream_generate(sess, prompt, model, system, thinking, on_progress)
