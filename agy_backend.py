@@ -44,6 +44,14 @@ CRED_TARGET = os.environ.get("AGY_CRED_TARGET", "gemini:antigravity")
 AGY_CLIENT_ID = os.environ.get("AGY_CLIENT_ID", "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com")
 AGY_CLIENT_SECRET = os.environ.get("AGY_CLIENT_SECRET", "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")
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+# OAuth refresh + the API path go STRAIGHT to Google (not via the :9999 proxy). When the VPS IP is
+# DPI-throttled you can route them through an external HTTP proxy by setting
+#   AGY_UPSTREAM_PROXY="http://user:pass@host:port"
+# Empty (the default) => direct connection (hosts->VPS). NEVER hard-code a proxy or credentials here:
+# keep them in the environment (e.g. the MCP server's `env` block in .claude.json) so they stay out
+# of git and out of this public repo.
+_UP = os.environ.get("AGY_UPSTREAM_PROXY", "")
+GPROXIES = ({"http": _UP, "https": _UP} if _UP else None)
 UA = "antigravity/cli/1.0.9 windows/amd64"
 DEFAULT_MODEL = os.environ.get("AGY_MODEL", "gemini-pro-agent")
 SWITCH_SCRIPT = os.environ.get(
@@ -52,6 +60,19 @@ SWITCH_SCRIPT = os.environ.get(
 )
 MAX_SWAPS = int(os.environ.get("AGY_MAX_SWAPS", "3"))
 HTTP_TIMEOUT = int(os.environ.get("AGY_HTTP_TIMEOUT", "600"))
+MAX_RETRIES = int(os.environ.get("AGY_MAX_RETRIES", "3"))         # ретраи обрыва SSE (IncompleteStream)
+SAFETY_RETRIES = int(os.environ.get("AGY_SAFETY_RETRIES", "2"))   # ретраи safety-флапа (ContentBlocked)
+# Keep-warm: на больших главах Pro High молчит ~60с (server-side thinking ~7k токенов) БЕЗ единого
+# байта в SSE — это idle-окно, в котором соединение РФ→VPS→Google рвут промежуточные таймауты.
+# Просим сервер стримить thoughts, чтобы канал не простаивал; текст thoughts парсер отбрасывает.
+KEEPWARM = os.environ.get("AGY_KEEPWARM", "1") != "0"
+# safetySettings: снимаем НАСТРАИВАЕМЫЕ фильтры (harassment/hate/sexual/dangerous/civic — дают
+# finishReason=SAFETY). ВНИМАНИЕ: PROHIBITED_CONTENT/BLOCKLIST/SPII/RECITATION у Google НЕотключаемы
+# (Prohibited Use Policy) — их это не уберёт; для них работает только ретрай-на-флапе в ask().
+SAFETY_OFF = os.environ.get("AGY_SAFETY_OFF", "1") != "0"
+_HARM_CATS = ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+              "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
+              "HARM_CATEGORY_CIVIC_INTEGRITY")
 
 
 def log(*a):
@@ -128,7 +149,7 @@ class Session:
         log("refreshing antigravity token...")
         r = requests.post(OAUTH_TOKEN_URL, data={
             "client_id": AGY_CLIENT_ID, "client_secret": AGY_CLIENT_SECRET,
-            "refresh_token": rt, "grant_type": "refresh_token"}, timeout=60)
+            "refresh_token": rt, "grant_type": "refresh_token"}, timeout=60, proxies=GPROXIES)
         if not r.ok:
             log("refresh FAILED", r.status_code, r.text[:200])
             return False
@@ -171,7 +192,13 @@ def build_body(proj, prompt, model, system, thinking):
     }
     if system:
         req["systemInstruction"] = {"role": "user", "parts": [{"text": system}]}
-    if thinking:
+    if SAFETY_OFF:
+        # снять настраиваемые safety-категории; PROHIBITED_CONTENT это НЕ покрывает (неотключаем)
+        req["safetySettings"] = [{"category": c, "threshold": "OFF"} for c in _HARM_CATS]
+    if KEEPWARM:
+        # держим SSE-канал тёплым во время длинной фазы thinking (см. KEEPWARM выше)
+        req["generationConfig"]["thinkingConfig"] = {"includeThoughts": True}
+    elif thinking:
         req["generationConfig"]["thinkingConfig"] = {"includeThoughts": False, "thinkingBudget": 10001}
     return {
         "project": proj,
@@ -187,51 +214,104 @@ class QuotaExceeded(Exception):
     pass
 
 
-def stream_generate(sess, prompt, model, system, thinking, on_progress=None):
+class IncompleteStream(Exception):
+    """SSE-поток оборвался ДО финального finishReason — т.е. соединение разорвано
+    (upstream/agy_proxy/VPS), а не модель закончила. agy_proxy маскирует такой разрыв под
+    обычный EOF (Connection: close без Content-Length), поэтому клиент получает «успех» с
+    усечённым/пустым телом. Это РЕТРАИБЕЛЬНО: переоткрытие соединения чинит."""
+    def __init__(self, partial_len, detail):
+        super().__init__("incomplete stream (got %d chars, no finishReason): %s" % (partial_len, detail))
+        self.partial_len = partial_len
+
+
+class ContentBlocked(Exception):
+    """Сервер ШТАТНО завершил поток (finishReason пришёл), но текста нет: ответ вырезан
+    safety/recitation/лимитом вывода. Это НЕ сеть. У Gemini safety недетерминирован (флапает
+    от прогона к прогону), поэтому ограниченно ретраибельно; причина уходит в stderr."""
+    def __init__(self, reason, message):
+        super().__init__("content blocked: %s — %s" % (reason, (message or "")[:200]))
+        self.reason = reason
+
+
+# finishReason'ы, означающие «сервер закончил, но текст вырезан/не сгенерирован» (НЕ обрыв сети).
+_BLOCK_FINISH = {"SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "SPII",
+                 "IMAGE_SAFETY", "MAX_TOKENS", "OTHER", "LANGUAGE", "MALFORMED_FUNCTION_CALL"}
+# Сетевые исключения requests/urllib3, при которых тело рвётся на полуслове (обрыв upstream).
+_NET_EXC = (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError,
+            requests.exceptions.ReadTimeout, requests.exceptions.ContentDecodingError)
+
+
+def stream_generate(sess, prompt, model, system, thinking, on_progress=None, _depth=0):
     if sess.proj is None:
         sess.load_project()
     body = build_body(sess.proj, prompt, model, system, thinking)
     r = requests.post(PROXY + "/v1internal:streamGenerateContent?alt=sse",
                       headers=sess.headers(), json=body, stream=True, timeout=HTTP_TIMEOUT)
     if r.status_code == 401:
+        if _depth >= 2:        # защита от бесконечной рекурсии при «вечном» 401
+            raise RuntimeError("streamGenerateContent HTTP 401 (refresh didn't help)")
         sess.refresh()
-        return stream_generate(sess, prompt, model, system, thinking, on_progress)
+        return stream_generate(sess, prompt, model, system, thinking, on_progress, _depth + 1)
     if r.status_code in (429,) or (r.status_code == 403 and "exhaust" in r.text.lower()):
         raise QuotaExceeded("HTTP %s" % r.status_code)
     if r.status_code != 200:
         raise RuntimeError("streamGenerateContent HTTP %s: %s" % (r.status_code, r.text[:300]))
+
     text = []
+    finish = None            # финальный finishReason (None => поток НЕ завершён штатно => обрыв)
+    finish_msg = None
+    net_exc = None
     # Decode the SSE stream as UTF-8 ourselves: cloudcode-pa omits charset, so
     # requests' decode_unicode=True would fall back to latin-1 and mojibake any
     # non-ASCII (e.g. Cyrillic) into double-encoded garbage.
-    for raw in r.iter_lines(decode_unicode=False):
-        if not raw:
-            continue
-        line = raw.decode("utf-8", "replace")
-        if not line.startswith("data:"):
-            continue
-        data = line[5:].strip()
-        if data == "[DONE]":
-            break
-        try:
-            j = json.loads(data)
-        except Exception:
-            continue
-        cands = (j.get("response", {}) or {}).get("candidates") or j.get("candidates") or []
-        for c in cands:
-            for p in c.get("content", {}).get("parts", []):
-                if p.get("thought"):
-                    continue
-                t = p.get("text")
-                if t:
-                    text.append(t)
-                    if on_progress:
-                        on_progress(t)
-        # surface mid-stream quota errors
-        err = j.get("error")
-        if err and ("RESOURCE_EXHAUSTED" in json.dumps(err) or err.get("code") == 429):
-            raise QuotaExceeded(json.dumps(err)[:200])
-    return "".join(text).strip()
+    try:
+        for raw in r.iter_lines(decode_unicode=False):
+            if not raw:
+                continue
+            line = raw.decode("utf-8", "replace")
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                finish = finish or "DONE"
+                break
+            try:
+                j = json.loads(data)
+            except Exception:
+                continue
+            cands = (j.get("response", {}) or {}).get("candidates") or j.get("candidates") or []
+            for c in cands:
+                fr = c.get("finishReason")
+                if fr:
+                    finish = fr
+                    finish_msg = c.get("finishMessage") or finish_msg
+                for p in c.get("content", {}).get("parts", []):
+                    if p.get("thought"):
+                        continue
+                    t = p.get("text")
+                    if t:
+                        text.append(t)
+                        if on_progress:
+                            on_progress(t)
+            # surface mid-stream quota errors
+            err = j.get("error")
+            if err and ("RESOURCE_EXHAUSTED" in json.dumps(err) or err.get("code") == 429):
+                raise QuotaExceeded(json.dumps(err)[:200])
+    except _NET_EXC as e:
+        net_exc = "%s: %s" % (type(e).__name__, str(e)[:160])
+
+    result = "".join(text).strip()
+    # Полнота определяется НАЛИЧИЕМ finishReason, а не тем, есть ли текст: усечённый ответ
+    # (текст есть, но finishReason не пришёл) — это тоже обрыв, его нельзя отдавать как успех.
+    if finish is not None and finish != "DONE":
+        if result and finish.upper() not in _BLOCK_FINISH:
+            return result                       # STOP с текстом — чистый полный ответ
+        if result:
+            return result                       # поздний SAFETY/PROHIBITED: текст уже собран — отдаём
+        raise ContentBlocked(finish, finish_msg)  # завершён, но текста нет — отказ модели
+    # finishReason не пришёл (None/DONE-без-текста) ИЛИ тело оборвалось сетевым исключением —
+    # это разрыв соединения, маскируемый agy_proxy под EOF. Ретрай.
+    raise IncompleteStream(len(result), net_exc or ("finish=%r, no terminal finishReason" % finish))
 
 
 def swap_account():
@@ -349,16 +429,38 @@ def ask(prompt, model=DEFAULT_MODEL, system=None, thinking=False, on_progress=No
     sess = Session()
     sess.ensure_fresh()
     ensure_quota_before(sess, model, load_config())
-    for attempt in range(MAX_SWAPS + 1):
+    swaps = incompletes = blocks = 0
+    last = None
+    # один общий потолок итераций (квота-свапы + ретраи обрывов + ретраи safety)
+    for _ in range(MAX_SWAPS + MAX_RETRIES + SAFETY_RETRIES + 1):
         try:
             return stream_generate(sess, prompt, model, system, thinking, on_progress)
         except QuotaExceeded as q:
-            log("quota exceeded (%s) attempt %d" % (q, attempt))
-            if attempt >= MAX_SWAPS or not swap_account():
+            last = q
+            log("quota exceeded (%s) swap %d/%d" % (q, swaps + 1, MAX_SWAPS))
+            if swaps >= MAX_SWAPS or not swap_account():
                 raise
+            swaps += 1
             sess.reload_after_swap()
             sess.ensure_fresh()
-    raise RuntimeError("exhausted all account swaps")
+        except IncompleteStream as e:
+            last = e
+            incompletes += 1
+            log("incomplete stream, retry %d/%d: %s" % (incompletes, MAX_RETRIES, e))
+            if incompletes > MAX_RETRIES:
+                # стабильный обрыв (деградация VPS/сети) — транзиент для движка (глава в pending)
+                raise RuntimeError("stream kept cutting off (network/proxy): %s" % e)
+            time.sleep(min(2 * incompletes, 6))   # короткий backoff перед переоткрытием соединения
+        except ContentBlocked as e:
+            last = e
+            blocks += 1
+            log("content blocked (%s), retry %d/%d: %s" % (e.reason, blocks, SAFETY_RETRIES, e))
+            if blocks > SAFETY_RETRIES:
+                # safety стабильно режет этот контент. Причина уже в stderr (выше). Пустой ответ
+                # с НЕнулевым rc, чтобы движок не принял пустоту за валидный перевод.
+                raise RuntimeError("content blocked by safety after %d retries: %s" % (SAFETY_RETRIES, e))
+            time.sleep(1)
+    raise RuntimeError("exhausted retries: %s" % last)
 
 
 def main():

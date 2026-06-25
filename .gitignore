@@ -6,6 +6,10 @@ __pycache__/
 _*.mjs
 _*.py
 _*.txt
+# local backups / probe scripts — never commit
+*.bak
+*.bak-*
+*probe*.py
 # never commit anything token/secret-shaped
 *oauth*
 *secret*

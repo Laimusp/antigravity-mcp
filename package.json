@@ -1,7 +1,7 @@
 {
   "name": "antigravity-mcp",
-  "version": "1.0.0",
-  "description": "MCP server exposing Google Antigravity (Gemini 3 Pro) as a headless tool for Claude Code. Talks directly to the Antigravity backend (streamGenerateContent) through the local RU-unlock proxy, using the Antigravity OAuth token from Windows Credential Manager, with automatic account rotation on quota.",
+  "version": "1.2.0",
+  "description": "MCP server exposing the Google Antigravity (Gemini 3 Pro) coding AGENT — with real Read/Write/Bash tools — to Claude Code as a headless second agent. Spawns the actual `agy` CLI agent (file-in / file-out, isolated temp dir) through the local RU-unlock proxy, using the Antigravity OAuth token from Windows Credential Manager, with automatic account rotation on quota. The raw streamGenerateContent path is kept for the ping health-check.",
   "type": "module",
   "main": "src/index.js",
   "bin": {
