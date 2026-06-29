@@ -5,8 +5,10 @@ Claude Code — a drop-in "second Claude Code" for review pipelines and second o
 
 > **This is a real agent, not a brain in a jar.** `ask-antigravity` / `ask-gemini` launch the actual
 > `agy` CLI agent, which has **Read / Write / Bash tools** just like Claude Code — so it can read
-> files, run commands and edit code, not merely emit text. (Earlier versions called the raw
-> `streamGenerateContent` API with no tools; that path now survives only behind `ping`.)
+> files, run commands and edit code, not merely emit text. **By default it works in the project
+> Claude runs in (`process.cwd()` → `--add-dir`), so it sees your repo like Codex** — no `workspace`
+> wiring needed. (Earlier versions called the raw `streamGenerateContent` API with no tools; that
+> path now survives only behind `ping`.)
 
 ## Why an agent, and why files
 
@@ -32,7 +34,7 @@ the two temp paths.
 ```
                           ask-antigravity / ask-gemini  (the AGENT, with file tools)
 Claude Code ──MCP(stdio)──► src/index.js ──spawn,stdin──► agy_agent.py ──► agy.exe -p … --dangerously-skip-permissions
-                                  │                              └─ file-in/out, isolated temp dir, account rotation
+                                  │                              └─ file-in/out, sees project by default (--add-dir cwd), account rotation
                                   └ ping (fast liveness) ──────► agy_backend.py ──► POST /v1internal:streamGenerateContent (raw, no tools)
 ```
 
@@ -40,8 +42,9 @@ Claude Code ──MCP(stdio)──► src/index.js ──spawn,stdin──► ag
   agent against it with `--dangerously-skip-permissions`, then reads back `out.txt`. The agent runs
   with `cwd` = a throwaway temp dir and `USERPROFILE`/`HOME` pointed at a **private profile**
   (`~/.agy-mcp-profile`) so its `~/.gemini/antigravity` lock never fights your interactive `agy`.
-  Without an explicit `workspace`, the agent can only touch its own `in.txt`/`out.txt` — i.e. it is
-  **read-only with respect to your repo**. Account rotation is imported from `agy_backend.py`.
+  By default `src/index.js` grants it `--add-dir <project>` (the `workspace` below) so it can read
+  and run your repo like Codex; pass `workspace:"none"` to lock it to its own `in.txt`/`out.txt`
+  (**read-only with respect to your repo**). Account rotation is imported from `agy_backend.py`.
 - **`agy_backend.py`** — the raw `streamGenerateContent` caller. Used now for **`ping`** (a fast
   liveness round-trip) and as the home of OAuth + **account rotation** (imported by `agy_agent.py`).
   Reads the Antigravity OAuth token from **Windows Credential Manager** (`gemini:antigravity`),
@@ -65,7 +68,7 @@ Hand the Gemini 3 agent a task / question / code to analyze, review, or solve. P
 | `prompt_file` | **absolute** path to a UTF-8 file used as the prompt (the agent reads it itself). Wins over `prompt`. Use this for large artifacts to keep the caller's context clean. |
 | `model` | model id; default = let `agy` pick (set `AGY_MODEL` — see the warning below). |
 | `system` / `system_file` | optional system instruction (inline or absolute file; file wins). |
-| `workspace` | optional **absolute** dir granted to the agent via `--add-dir` so it can **read** your repo. ⚠️ This also makes that dir **writable** to the agent — omit it for read-only review (e.g. a "Triumvirate" review where all context belongs in the prompt). |
+| `workspace` | **absolute** dir granted to the agent via `--add-dir` (**read + write**). **Default (omit): the project Claude runs in (`process.cwd()`)** — so the agent sees your repo automatically, like Codex. Pass another dir to point it elsewhere, or `"none"` to lock it to a throwaway temp dir (old read-only-by-isolation). ⚠️ When it can see the repo it can also write it — for a read-only review (e.g. a "Triumvirate") rely on a capslock instruction in the prompt, same as Codex. |
 | `cleanup` | delete `prompt_file` / `system_file` after the call (default `false`). |
 
 ### `ping`
@@ -139,9 +142,9 @@ Both rotate via the sibling [`antigravity-auth-manager`](../antigravity-auth-man
 ## Caveats
 
 - The agent runs with `--dangerously-skip-permissions` — it **will** execute Bash and write files
-  without prompting. It's sandboxed to a throwaway temp `cwd` by default; passing `workspace` opens
-  the named dir for **read *and* write**. Don't pass `workspace` for untrusted prompts or read-only
-  reviews.
+  without prompting. By default it is granted the project dir (`process.cwd()`) for **read *and*
+  write**, like Codex; pass `workspace:"none"` to lock it to a throwaway temp `cwd` for untrusted
+  prompts or read-only reviews (then keep all context in the prompt).
 - This relies on the private Antigravity backend (reverse-engineered request shape) and an OAuth
   token meant for the first-party CLI — it can break on Antigravity updates, and heavy/abusive use
   of free accounts carries Google ToS/ban risk. Use disposable accounts and a pool.

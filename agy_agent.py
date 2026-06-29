@@ -18,8 +18,10 @@ read that file. This is also why we don't put the (possibly huge) user prompt in
 in.txt, argv only carries the short fixed wrapper + temp paths (no Windows argv limit, no injection).
 
 Isolation: the agent runs with USERPROFILE/HOME pointed at a private dir so its ~/.gemini/antigravity
-state (knowledge.lock) does NOT fight the user's interactive `agy`. cwd is the temp dir, so without
-an explicit --workspace the agent can only touch its own in/out files (read-only w.r.t. the repo).
+state (knowledge.lock) does NOT fight the user's interactive `agy`. cwd is the temp dir. The MCP
+layer (src/index.js) by DEFAULT passes --workspace = the project Claude runs in (process.cwd()), so
+the agent SEES the repo like Codex does. Without --workspace (a direct run, or workspace:"none") the
+agent can only touch its own in/out files (read-only w.r.t. the repo).
 
 Auth + geo-unlock + rotation: the agent authenticates with the Antigravity token in Windows
 Credential Manager and goes through the local RU-unlock proxy (CLOUD_CODE_URL). Account rotation is
@@ -108,7 +110,7 @@ def run_agent(prompt, model=None, workspace=None, timeout=TIMEOUT):
         args = [AGY_EXE, "-p", wrapped, "--dangerously-skip-permissions"]
         if model:
             args += ["--model", model]
-        if workspace:                       # let the agent READ the repo too (opt-in; also writable!)
+        if workspace:                       # see the repo (default = project cwd, set by index.js; read+write)
             args += ["--add-dir", workspace]
         try:
             p = subprocess.run(args, input=b"", capture_output=True,
